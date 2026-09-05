@@ -2,3 +2,6 @@
 # Do not commit kaggle datasets
 data/
 *.csv
+
+# IDE
+.idea/
