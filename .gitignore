@@ -1,0 +1,4 @@
+
+# Do not commit kaggle datasets
+data/
+*.csv
