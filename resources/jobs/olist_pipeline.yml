@@ -1,0 +1,32 @@
+resources:
+  jobs:
+    olist_pipeline:
+      name: olist_full_pipeline
+      max_concurrent_runs: 1
+
+      tasks:
+        # BRONZE — pa varesi, hapi i pare
+        - task_key: run_bronze
+          notebook_task:
+            notebook_path: ../../06-orchestration/04_run_bronze
+
+        # SILVER — varet nga bronze
+        - task_key: run_silver
+          depends_on:
+            - task_key: run_bronze
+          notebook_task:
+            notebook_path: ../../06-orchestration/05_run_silver
+
+        # GOLD — varet nga silver
+        - task_key: run_gold
+          depends_on:
+            - task_key: run_silver
+          notebook_task:
+            notebook_path: ../../06-orchestration/06_run_gold
+
+        # DATA QUALITY — varet nga gold, gate-i final
+        - task_key: data_quality
+          depends_on:
+            - task_key: run_gold
+          notebook_task:
+            notebook_path: ../../06-orchestration/03_data_quality
