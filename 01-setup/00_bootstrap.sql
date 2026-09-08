@@ -10,3 +10,5 @@ CREATE SCHEMA IF NOT EXISTS olist.control;
 CREATE SCHEMA IF NOT EXISTS olist.quarantine;
 
 CREATE VOLUME IF NOT EXISTS olist.landing.files;
+
+CREATE VOLUME IF NOT EXISTS olist.control.streaming_state;
