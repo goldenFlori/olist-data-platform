@@ -1,0 +1,12 @@
+bundle:
+  name: olist-data-platform
+
+include:
+  - resources/jobs/*.yml
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      host: https://dbc-8725456a-3f22.cloud.databricks.com
