@@ -1,25 +1,32 @@
 # Olist Data Platform
 
-End-to-end lakehouse project on Databricks for the Brazilian E-Commerce (Olist) dataset. Nine raw CSV files are ingested into Bronze, cleaned and validated in Silver, modeled into a dimensional Gold layer, and consumed by a Power BI semantic model and three-page report.
+End-to-end lakehouse project on Databricks for the Brazilian E-Commerce (Olist) dataset. Nine raw CSV files are ingested into Bronze with Auto Loader, cleaned and validated in Silver, modeled into a dimensional Gold layer, orchestrated as a Databricks job, and consumed by Power BI.
 
-**Stack:** PySpark, Delta Lake, Unity Catalog, Databricks Jobs / SQL Warehouse, Power BI, Git
+**Stack:** PySpark, Delta Lake, Unity Catalog, Databricks Jobs, Databricks SQL Warehouse, Power BI, GitHub Actions, PySpark ML
+
+**Repository:** https://github.com/goldenFlori/olist-data-platform
 
 ## Architecture
 
 ```text
-Kaggle CSVs
-    |
+Kaggle CSVs (9 files)
+        |
 Unity Catalog landing volume
-    |
-Bronze  - raw ingestion + lineage metadata
-    |
-Silver  - typing, cleaning, deduplication, validation, quarantine
-    |
-Gold    - 3 facts + 5 conformed dimensions + 1 aggregate
-    |
+        |
+Bronze - Auto Loader / Structured Streaming + lineage metadata + Delta
+        |
+Silver - profiling, typing, cleaning, deduplication, validation, quarantine
+        |
+Gold - 3 facts + 5 dimensions + 1 aggregate
+        |
 Databricks SQL Warehouse
-    |
-Power BI Import model (15 DAX measures, 3 report pages, seller-state RLS)
+        |
+Power BI Import report
+
+Bonus paths:
+Silver -> Random Forest -> gold.order_delivery_predictions -> Power BI
+Gold -> Unity Catalog row filters -> DirectQuery RLS demonstration
+GitHub push -> GitHub Actions -> databricks bundle validate
 ```
 
 ## Dataset
@@ -28,22 +35,42 @@ Source: **Brazilian E-Commerce Public Dataset by Olist** on Kaggle.
 
 https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce
 
-The project uses the nine related CSV files described in the exercise, representing roughly 100,000 orders from 2016-2018. Source data is intentionally not committed to this repository.
+The project uses the nine related CSV files from the exercise, representing roughly 100,000 orders from 2016-2018. Source data is not committed to the repository.
+
+Final Bronze row counts after Auto Loader ingestion:
+
+| Source | Rows |
+|---|---:|
+| orders | 99,441 |
+| order_items | 112,650 |
+| order_payments | 103,886 |
+| order_reviews | 99,224 |
+| customers | 99,441 |
+| sellers | 3,095 |
+| products | 32,951 |
+| geolocation | 1,000,163 |
+| category_tr | 71 |
+
+All nine Bronze tables were validated with non-null ingestion metadata and independent streaming checkpoints.
 
 ## Key design decisions
 
-- **Bronze** preserves the ingested source values and adds lineage metadata: source file, ingestion timestamp, and batch/run identifier.
-- **Silver** centralizes cleaning rules, type enforcement, deduplication, geolocation resolution, category translation, delivery-funnel derivation, and quarantine handling.
-- **Gold** keeps order items, payments, and orders in separate fact tables so each measure is evaluated at its correct grain.
-- `customer_unique_id` is the customer business key because `customer_id` is order-specific in the source.
-- `dim_date` is built in the pipeline rather than in Power BI.
+- **Bronze** preserves source values and adds `source_file`, `ingestion_timestamp`, and `batch_id`.
+- Bronze ingestion uses Databricks **Auto Loader (`cloudFiles`)** with explicit schemas, `availableNow=True`, and one checkpoint per source.
+- `order_reviews` is read with multiline support; `geolocation` is partitioned by `geolocation_state`.
+- **Silver** centralizes type enforcement, profiling, deduplication, category translation, geolocation resolution, delivery-funnel derivation, and quarantine rules.
+- **Gold** keeps orders, order items, and payments in separate facts so every metric is evaluated at its correct grain.
+- `customer_unique_id` is the customer business key because source `customer_id` is order-specific.
+- `dim_date` is created in the pipeline, not in Power BI.
 - `agg_daily_category` provides a reporting-oriented pre-aggregation.
 - Incremental order processing reads a stored watermark and uses Delta `MERGE` for idempotent upserts.
-- Power BI loads Gold only and uses Import mode for fast interactive analysis.
+- Power BI loads Gold only; the primary report uses Import mode.
+- Lakehouse row-level security is enforced with Unity Catalog row filters for seller-state access.
+- A Random Forest regression model writes delivery-delay predictions to a separate Gold table instead of modifying the core fact model.
 
 ## Gold model
 
-### Facts
+### Core facts
 
 | Table | Grain |
 |---|---|
@@ -55,14 +82,21 @@ The project uses the nine related CSV files described in the exercise, represent
 
 `dim_customer`, `dim_product`, `dim_seller`, `dim_geography`, `dim_date`
 
+### Reporting / bonus outputs
+
+- `agg_daily_category` - daily category reporting aggregate.
+- `order_delivery_predictions` - Bonus 5 ML output with one row per delivered order used for model scoring/reporting.
+
 ### Fan-out handling
 
-Items and payments are intentionally not folded into one fact. A direct order-level join inflates both measures because an order can have multiple items and multiple payment rows.
+Items and payments are intentionally not folded into one fact. An order can have multiple items and multiple payment rows, so a direct join by `order_id` duplicates both sides.
 
 Validated totals used in the project:
 
-- Item revenue: ~BRL **13.6M** at the correct item grain; ~BRL **14.2M** after fan-out.
-- Payment value: ~BRL **16.0M** at the correct payment grain; ~BRL **20.3M** after fan-out.
+- Correct item revenue: approximately **BRL 13.6M**.
+- Item revenue after a fan-out join: approximately **BRL 14.2M**.
+- Correct payment value: approximately **BRL 16.0M**.
+- Payment value after a fan-out join: approximately **BRL 20.3M**.
 
 The Power BI model therefore measures revenue from `fact_order_items` and payment value from `fact_payments` independently.
 
@@ -79,7 +113,7 @@ cd olist-data-platform
 
 Download the nine CSV files from Kaggle and keep the original filenames.
 
-### 3. Bootstrap the Databricks environment
+### 3. Bootstrap Databricks
 
 Run:
 
@@ -87,38 +121,40 @@ Run:
 01-setup/00_bootstrap.sql
 ```
 
-This creates the `olist` catalog, the required schemas, and the governed landing volume.
+This creates the `olist` catalog, required schemas, and governed landing volume.
 
-### 4. Upload the nine CSV files
+### 4. Upload the nine source files
 
-Upload the dataset files to:
+Upload the CSV files to:
 
 ```text
 /Volumes/olist/landing/files/
 ```
 
-### 5. Run the full pipeline
+### 5. Run the main pipeline
 
-The orchestrated job is defined in:
+The job definition is:
 
 ```text
 resources/jobs/olist_pipeline.yml
 ```
 
-It runs the layers in dependency order:
+Its dependency chain is:
 
 ```text
-Bronze -> Silver -> Gold -> Data Quality
+run_bronze -> run_silver -> run_gold -> data_quality
 ```
 
-You can also run the layer runners directly in this order:
+The layer runners are:
 
 ```text
-06-orchestration/04_run_bronze
-06-orchestration/05_run_silver
-06-orchestration/06_run_gold
-06-orchestration/03_data_quality
+06-orchestration/04_run_bronze.ipynb
+06-orchestration/05_run_silver.ipynb
+06-orchestration/06_run_gold.ipynb
+06-orchestration/03_data_quality.ipynb
 ```
+
+The current DQ run passes the implemented row-count/freshness, uniqueness, seven referential-integrity relationships, and range checks.
 
 ### 6. Reproduce the incremental-load simulation
 
@@ -128,13 +164,13 @@ Initialize the control objects:
 06-orchestration/01_control_setup
 ```
 
-Then use:
+Then run:
 
 ```text
 06-orchestration/02_incremental_demo
 ```
 
-The history run loads data through the initial cutoff (`2017-12-31`). Incremental mode reads the stored watermark, processes only later orders, MERGEs them into the fact table, and advances the watermark after a successful write.
+The historical load uses `2017-12-31` as the initial cutoff. Later runs read the stored watermark, process only newer orders, `MERGE` into the target, and advance the watermark after success.
 
 ### 7. Run the backend performance benchmark
 
@@ -144,7 +180,7 @@ Run:
 07-performance/01_optimize
 ```
 
-The current benchmark records the same revenue-by-date query before and after `OPTIMIZE` + Z-ORDER:
+Measured revenue-by-date query:
 
 ```text
 Before: 0.84 s
@@ -152,64 +188,146 @@ After:  0.63 s
 Gain:   25.3%
 ```
 
-Z-ORDER improves **data skipping** by colocating related values; it is distinct from partition pruning.
+Z-ORDER improves **data skipping** by colocating related values. It is not the same mechanism as partition pruning.
 
-### 8. Open Power BI
+### 8. Validate the Databricks Asset Bundle
 
-Start a Databricks SQL Warehouse and open:
+The bundle root is:
 
 ```text
-powerbi/olist_report.pbix
+databricks.yml
 ```
 
-Power BI connects to the Gold layer in Import mode. The current model is about 24 MB and contains 15 DAX measures, a three-page report, and seller-state row-level security.
+and includes:
+
+```text
+resources/jobs/*.yml
+```
+
+Local validation:
+
+```bash
+databricks bundle validate --target dev
+```
+
+GitHub Actions runs the same validation from:
+
+```text
+.github/workflows/validate-bundle.yml
+```
+
+The workflow authenticates through repository secrets `DATABRICKS_HOST` and `DATABRICKS_TOKEN`. No token is stored in source control. The CI step validates the bundle configuration; it does not deploy or execute the pipeline.
+
+### 9. Run the optional lakehouse RLS bonus
+
+Run:
+
+```text
+04-gold/10_rls_lakehouse.ipynb
+```
+
+The notebook creates an entitlement mapping and Unity Catalog row-filter functions, then applies row filters to seller-scoped Gold tables. The validation used seller state `SP` and confirmed zero visible rows outside the assigned state.
+
+### 10. Run the ML delivery-delay bonus
+
+Run:
+
+```text
+04-gold/11_delivery_delay_predictions.ipynb
+```
+
+The notebook trains a PySpark ML Random Forest regression model from Silver data and writes:
+
+```text
+olist.gold.order_delivery_predictions
+```
+
+Final test-set results:
+
+- Chronological split: 80% train / 20% test.
+- Train rows: **77,172**.
+- Test rows: **19,298**.
+- Test MAE from Gold: approximately **5.05 days**.
+- Median baseline MAE: **7.57 days**.
+- Test R2: **0.530**.
+- MAE improvement versus baseline: approximately **33%**.
+
+### 11. Open Power BI
+
+Primary Import report:
+
+```text
+powerbi/olist_report_import.pbix
+```
+
+DirectQuery variant:
+
+```text
+powerbi/olist_report_directquery.pbix
+```
+
+The Import report contains the three required business pages plus a fourth ML validation page:
+
+1. Executive Overview
+2. Delivery & Operations
+3. Product & Seller Performance
+4. Delivery Delay Prediction
+
+The base semantic model contains 15 core DAX measures; the ML page adds prediction-focused measures.
+
+## Bonus features
+
+| Bonus | Status | Implementation |
+|---|---|---|
+| **1 - Auto Loader / Structured Streaming** | Complete | All nine Bronze sources use `cloudFiles`, source-specific checkpoints, explicit schemas, and `availableNow` processing. |
+| **2 - Databricks Asset Bundle + CI** | Complete | `databricks.yml`, `resources/jobs/olist_pipeline.yml`, and GitHub Actions `databricks bundle validate --target dev`. |
+| **3 - Lakehouse RLS** | Complete | Unity Catalog entitlement mapping + row-filter UDFs on `dim_seller` and `fact_order_items`; SP validation passed. |
+| **4 - Import + DirectQuery** | Partial relative to the exercise wording | Import and DirectQuery Power BI versions were created, and DirectQuery is used to demonstrate lakehouse RLS. A formal refresh-time, query-time, and model-size comparison was not performed. |
+| **5 - ML model output in Gold** | Complete | Random Forest delivery-delay predictions are written to `gold.order_delivery_predictions` and shown alongside actual delay in Power BI. |
 
 ## Data quality
 
-The pipeline includes both one-time source profiling and an automated DQ gate. The gate checks:
+The pipeline includes one-time source profiling plus an automated DQ gate. The gate validates:
 
-- Non-empty expected tables.
-- Freshness based on the latest order date.
-- Uniqueness of dimension keys.
-- Seven implemented fact-to-dimension referential-integrity relationships.
+- Expected non-empty tables and source freshness.
+- Dimension-key uniqueness.
+- Seven implemented fact-to-dimension referential-integrity checks.
 - Valid ranges for item price, freight value, and review score.
 
-A failed rule stops the pipeline before invalid data reaches Power BI.
+Notable issues handled include multiline review parsing, duplicate/invalid reviews, geolocation normalization, non-positive payment values, missing product attributes, and repair of a malformed seller city using ZIP-based geography.
 
-Notable source issues handled by the project include multiline review parsing, duplicated reviews, invalid/null review records, inconsistent geolocation city formatting, non-positive payment values, missing product attributes, and a seller city value that had to be recovered from ZIP geography.
+## Power BI model and reporting
 
-## Power BI report
+The primary Power BI model uses single-direction relationships and marks `dim_date` as the date table. Revenue, payment value, order-level delivery metrics, and customer metrics remain on their natural fact grains.
 
-The report contains three pages:
+The original three-page Import model was approximately **24 MB** before the bonus ML output was added. No new formal Import-versus-DirectQuery performance comparison is claimed after the bonus work.
 
-1. **Executive Overview** - overall business performance, headline KPIs, revenue trend, category and state breakdown.
-2. **Delivery & Operations** - on-time delivery, funnel timings, delivery variance, state performance, and worst routes.
-3. **Product & Seller Performance** - category/seller contribution, customer satisfaction, low-review share, and repeat-customer analysis.
-
-The semantic model uses single-direction dimension-to-fact filtering and marks `dim_date` as the date table.
+The DirectQuery variant is used primarily to demonstrate source-backed query behavior and Unity Catalog RLS. Because the lakehouse RLS demonstration restricts seller-scoped data to `SP`, a raw performance comparison against the full Import model would not be a strict like-for-like benchmark.
 
 ## Project structure
 
 ```text
-00-common/         Shared config, helper functions and schemas
-01-setup/          Unity Catalog / schema / volume bootstrap
-02-bronze/         Raw ingestion, one notebook per source
-03-silver/         Profiling, cleaning, validation and quarantine
-04-gold/           Facts, dimensions and reporting aggregate
-05-analytics/      Reserved for SQL analytics views (planned)
-06-orchestration/  Control setup, incremental demo, DQ and layer runners
-07-performance/    OPTIMIZE / Z-ORDER benchmark
-resources/jobs/    Databricks job definition
-powerbi/           Power BI .pbix report
-docs/              Project documentation
+.github/workflows/   GitHub Actions bundle validation
+00-common/           Shared config, schemas, Auto Loader helper
+01-setup/            Unity Catalog / schema / volume bootstrap
+02-bronze/           Auto Loader ingestion, one notebook per source
+03-silver/           Profiling, cleaning, validation, quarantine
+04-gold/             Facts, dimensions, aggregate, RLS and ML bonus notebooks
+05-analytics/        Analytics work
+06-orchestration/    Control setup, incremental demo, DQ and layer runners
+07-performance/      OPTIMIZE / Z-ORDER benchmark
+resources/jobs/      Databricks job definition
+powerbi/             Import / DirectQuery PBIX reports and screenshots
+docs/                Project documentation
+databricks.yml       Databricks Asset Bundle root configuration
 ```
 
 ## Environment notes
 
-The project was built on **Databricks Free Edition**. The environment is serverless and has a five-task concurrency limit, so the layers are executed sequentially. Managed tables are used because external storage locations are not available in the selected Free Edition setup.
+The project was built in a Databricks Free Edition / serverless environment. The layer runners execute sequentially, which also keeps the dependency path explicit and reproducible.
 
-Power BI Desktop is Windows-only, so the report was developed in a Windows virtual machine and connected to the Databricks SQL Warehouse.
+Power BI Desktop is Windows-only, so report development was performed in a Windows environment connected to the Databricks SQL Warehouse.
 
 ## Documentation
 
-Detailed implementation notes, assumptions, data-quality findings, model design, fan-out explanation, performance results, and challenges are available under `docs/`.
+Detailed architecture, data model, assumptions, data-quality findings, incremental design, performance results, bonus implementations, ML methodology, and challenges are documented under `docs/`.
